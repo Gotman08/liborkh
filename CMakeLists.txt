@@ -35,4 +35,5 @@ add_liborkh_test(extract_gpu_elf        tests/main_extract_gpu_elf.c)
 add_liborkh_test(extract_gpu_fatbin     tests/main_extract_gpu_fatbin.c)
 add_liborkh_test(print_nb_kernel        tests/main_print_nb_kernel.c)
 add_liborkh_test(print_total_nb_kernels tests/main_print_total_nb_kernels.c)
+add_liborkh_test(nv_inspect             tests/main_nv_inspect.c)
 

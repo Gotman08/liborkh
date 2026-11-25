@@ -5,6 +5,9 @@
 #include <libgen.h>
 
 #include "liborkh.h"
+#include "liborkh_nv_fatbin.h"
+#include <string.h>
+#include <stdio.h>
 
 // -------------- Helper functions to parse Lua table into filter struct --------------
 /**
@@ -302,6 +305,161 @@ static int l_free_metadata_buffer(lua_State* L) {
 }
 
 
+
+// ------------------------------- NVIDIA (fatbin / cubin) -------------------------------
+
+#define SET_INT(L, key, v)  do { lua_pushnumber(L, (lua_Number)(v)); lua_setfield(L, -2, key); } while (0)
+#define SET_STR(L, key, v)  do { lua_pushstring(L, (v) ? (v) : ""); lua_setfield(L, -2, key); } while (0)
+
+static void push_xyz(lua_State* L, const char* key, const uint32_t v[3])
+{
+    lua_createtable(L, 3, 0);
+    for (int i = 0; i < 3; i++) { lua_pushnumber(L, v[i]); lua_rawseti(L, -2, i + 1); }
+    lua_setfield(L, -2, key);
+}
+
+static void push_nv_kernel(lua_State* L, const liborkh_nv_kernel_t* k, int with_attrs)
+{
+    lua_newtable(L);
+    SET_STR(L, "name", k->name);
+    lua_pushboolean(L, k->is_entry); lua_setfield(L, -2, "is_entry");
+    SET_INT(L, "registers", k->registers);
+    SET_INT(L, "text_size", k->text_size);
+    SET_INT(L, "shared_static", k->shared_static);
+    SET_INT(L, "local_size", k->local_size);
+    SET_INT(L, "constant0_size", k->constant0_size);
+    SET_INT(L, "param_size", k->param_size);
+    SET_INT(L, "num_params", k->num_params);
+    SET_INT(L, "frame_size", k->frame_size);
+    SET_INT(L, "min_stack_size", k->min_stack_size);
+    SET_INT(L, "max_stack_size", k->max_stack_size);
+    SET_INT(L, "crs_stack_size", k->crs_stack_size);
+    SET_INT(L, "max_reg_count", k->max_reg_count);
+    push_xyz(L, "max_threads", k->max_threads);
+    push_xyz(L, "req_ntid", k->req_ntid);
+    push_xyz(L, "cluster_dim", k->cluster_dim);
+    SET_INT(L, "max_cluster_rank", k->max_cluster_rank);
+    SET_INT(L, "num_barriers", k->num_barriers);
+    SET_INT(L, "num_exits", k->num_exits);
+    lua_pushboolean(L, (k->flags & LIBORKH_NV_KFLAG_CTAIDZ_USED) != 0); lua_setfield(L, -2, "ctaidz_used");
+    lua_pushboolean(L, (k->flags & LIBORKH_NV_KFLAG_WMMA_USED) != 0);   lua_setfield(L, -2, "wmma_used");
+    lua_pushboolean(L, (k->flags & LIBORKH_NV_KFLAG_COOP_GROUPS) != 0); lua_setfield(L, -2, "coop_groups");
+    lua_pushboolean(L, (k->flags & LIBORKH_NV_KFLAG_ATOMIC_SYS) != 0);  lua_setfield(L, -2, "atomic_sys");
+    lua_pushboolean(L, (k->flags & LIBORKH_NV_KFLAG_MBARRIER) != 0);    lua_setfield(L, -2, "mbarrier");
+    if (with_attrs) {
+        lua_createtable(L, (int)k->nattrs, 0);
+        for (size_t a = 0; a < k->nattrs; a++) {
+            const liborkh_nv_attr_t* at = &k->attrs[a];
+            lua_newtable(L);
+            SET_STR(L, "attr", liborkh_nv_attr_name(at->attr));
+            SET_INT(L, "format", at->format);
+            SET_INT(L, "size", at->size);
+            if (at->size == 2) { SET_INT(L, "value", (uint32_t)at->data[0] | ((uint32_t)at->data[1] << 8)); }
+            else if (at->size == 1) { SET_INT(L, "value", at->data[0]); }
+            else if (at->size >= 4) {
+                lua_createtable(L, at->size / 4, 0);
+                for (int w = 0; w < at->size / 4 && w < 64; w++) {
+                    uint32_t v; memcpy(&v, at->data + 4 * w, 4);
+                    lua_pushnumber(L, v); lua_rawseti(L, -2, w + 1);
+                }
+                lua_setfield(L, -2, "words");
+            }
+            lua_rawseti(L, -2, (int)a + 1);
+        }
+        lua_setfield(L, -2, "attributes");
+    }
+}
+
+/**
+ * liborkh.nv_inspect(path [, opts]) -> array of images | nil, err
+ *   opts.target_arch : only keep the images of this SM (e.g. 90)
+ *   opts.dump_dir    : write every decoded image (cubin / ptx) in this directory
+ *   opts.attributes  : include the raw .nv.info attributes of every kernel
+ */
+static int l_nv_inspect(lua_State* L)
+{
+    const char* path = luaL_checkstring(L, 1);
+    int target_arch = 0, attrs = 0;
+    const char* dump_dir = NULL;
+    if (lua_istable(L, 2)) {
+        target_arch = get_int_field(L, "target_arch", 0);
+        lua_getfield(L, 2, "dump_dir");
+        if (lua_isstring(L, -1)) dump_dir = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "attributes");
+        attrs = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+
+    liborkh_nv_image_list_t list;
+    char err[512] = {0};
+    if (liborkh_nv_load_file(path, &list, err, sizeof(err)) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, err);
+        return 2;
+    }
+
+    lua_newtable(L);
+    int idx = 0;
+    for (size_t i = 0; i < list.count; i++) {
+        liborkh_nv_image_t* img = &list.images[i];
+        if (target_arch && (int)img->sm != target_arch) continue;
+        lua_newtable(L);
+        SET_STR(L, "kind", img->kind == LIBORKH_NV_KIND_ELF ? "cubin" : (img->kind == LIBORKH_NV_KIND_PTX ? "ptx" : "unknown"));
+        SET_INT(L, "sm", img->sm);
+        SET_INT(L, "virtual_sm", img->virtual_sm);
+        SET_INT(L, "elf_abi_version", img->elf_abi_version);
+        SET_INT(L, "ptx_major", img->ptx_major);
+        SET_INT(L, "ptx_minor", img->ptx_minor);
+        SET_INT(L, "flags", (lua_Number)img->flags);
+        SET_STR(L, "compression", img->compressed == 1 ? "lz4" : (img->compressed == 2 ? "zstd" : "none"));
+        lua_pushboolean(L, img->data != NULL); lua_setfield(L, -2, "decoded");
+        lua_pushboolean(L, (img->flags & LIBORKH_NV_FLAG_DEBUG) != 0); lua_setfield(L, -2, "debug");
+        SET_INT(L, "size", img->size);
+        SET_STR(L, "origin", img->origin);
+        SET_STR(L, "identifier", img->identifier);
+        if (dump_dir && img->data && img->size) {
+            char fname[1024];
+            snprintf(fname, sizeof(fname), "%s/image_%zu_sm_%u.%s", dump_dir, i, img->sm,
+                     img->kind == LIBORKH_NV_KIND_ELF ? "cubin" : "ptx");
+            FILE* f = fopen(fname, "wb");
+            if (f) {
+                fwrite(img->data, 1, img->size, f);
+                fclose(f);
+                SET_STR(L, "file", fname);
+            }
+        }
+        lua_createtable(L, (int)img->nkernels, 0);
+        for (size_t k = 0; k < img->nkernels; k++) {
+            push_nv_kernel(L, &img->kernels[k], attrs);
+            lua_rawseti(L, -2, (int)k + 1);
+        }
+        lua_setfield(L, -2, "kernels");
+        lua_rawseti(L, -2, ++idx);
+    }
+    liborkh_nv_free_list(&list);
+    return 1;
+}
+
+/** liborkh.nv_kernel_count(path) -> number of entry kernels (cubin + PTX images). */
+static int l_nv_kernel_count(lua_State* L)
+{
+    const char* path = luaL_checkstring(L, 1);
+    liborkh_nv_image_list_t list;
+    char err[512] = {0};
+    if (liborkh_nv_load_file(path, &list, err, sizeof(err)) != 0) {
+        lua_pushnumber(L, 0);
+        return 1;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < list.count; i++)
+        for (size_t k = 0; k < list.images[i].nkernels; k++)
+            if (list.images[i].kernels[k].is_entry) n++;
+    liborkh_nv_free_list(&list);
+    lua_pushnumber(L, (lua_Number)n);
+    return 1;
+}
+
 /**
  * Lua module entry point
  */
@@ -310,6 +468,8 @@ int luaopen_liborkh_lua(lua_State *L) {
         {"get_kernel_count", l_get_kernel_count},
         {"get_metadata_buffer", l_get_metadata_buffer},
         {"free_metadata_buffer", l_free_metadata_buffer},
+        {"nv_inspect", l_nv_inspect},
+        {"nv_kernel_count", l_nv_kernel_count},
         {NULL, NULL}
     };
 
